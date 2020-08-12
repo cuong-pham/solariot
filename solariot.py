@@ -58,11 +58,7 @@ modmap = __import__(modmap_file)
 
 print ("Load ModbusTcpClient")
 
-client = ModbusTcpClient(config.inverter_ip, 
-                         timeout=config.timeout,
-                         RetryOnEmpty=True,
-                         retries=3,
-                         port=config.inverter_port)
+client = ModbusTcpClient(config.inverter_ip, port=config.inverter_port)
 print("Connect")
 client.connect()
 
@@ -92,10 +88,16 @@ def load_registers(type,start,COUNT=100):
       rr = client.read_input_registers(int(start), 
                                        count=int(COUNT), 
                                        unit=config.slave)
+
     elif type == "holding":
       rr = client.read_holding_registers(int(start), 
                                          count=int(COUNT), 
                                          unit=config.slave)
+    if len(rr.registers) != int(COUNT):
+      print(rr.registers)
+      print("Mismatched number ({}) of registers read".format(len(rr.registers)))
+      return
+
     for num in range(0, int(COUNT)):
       run = int(start) + num + 1
       if type == "read" and modmap.read_register.get(str(run)):
@@ -191,15 +193,50 @@ def publish_mqtt(inverter):
   except:
     result = None
 
+
+def publish_pv_output(inverter_data, ts):
+  instants_powers = [id.get('total_active_power') for id in inverter_data if id.get('total_active_power')]
+  temp =  [id.get('internal_temp') for id in inverter_data if id.get('internal_temp')]
+  grid_voltage = [id.get('grid_voltage') for id in inverter_data if id.get('grid_voltage')]
+
+  avg_power = sum(instants_powers)/len(instants_powers)
+  avg_temp = sum(temp)/len(temp)
+  avg_voltage = sum(grid_voltage)/len(grid_voltage)
+
+  query_string = {
+    "d": ts.strftime("%Y%m%d"),
+    "t": ts.strftime("%H:%M"),
+    "v1": round(inverter_data[-1]['daily_power_yield'] * 1000, 0),
+    "v2": round(avg_power, 0),
+    "v5": round(avg_temp, 1),
+    "v6": round(avg_voltage, 1)
+  }
+
+  headers = {
+    'X-Pvoutput-Apikey': "%s" % config.pv_output_api,
+    'X-Pvoutput-SystemId': "%s" % config.pv_output_sid,
+    'Content-Type': "application/x-www-form-urlencoded",
+    'cache-control': "no-cache"
+  }
+  response = requests.request("POST", url=config.pv_output_url, headers=headers, params=query_string)
+  if response.status_code != requests.codes.ok:
+    print(f"Fail to upload {response.text}'")
+  else:
+    print("Successfully posted to pvoutput")
+
+previous_minute = None
+inverter_data = []
+first = True
 while True:
   try:
     inverter = {}
-    
+    client.connect()
+    ts = datetime.datetime.now()
     if 'sungrow-' in config.model:
-      for i in bus['read']:
+      for i in bus.get('read', []):
         load_registers("read",i['start'],i['range']) 
-      for i in bus['holding']:
-        load_registers("holding",i['start'],i['range']) 
+      for i in bus.get('holding',[]):
+        load_registers("holding",i['start'],i['range'])
       
       # Sungrow inverter specifics:
       # Work out if the grid power is being imported or exported
@@ -217,8 +254,9 @@ while True:
     
     if 'sma-' in config.model:
       load_sma_register(modmap.sma_registers)
-    
-    print (inverter)
+
+    if len(inverter) > 1:
+      print (inverter)
 
     if mqtt_client is not None:
       t = Thread(target=publish_mqtt, args=(inverter,))
@@ -237,8 +275,17 @@ while True:
       t = Thread(target=publish_influx, args=(metrics,))
       t.start()
 
+    if config.pv_output_api:
+      if ts.minute % 5 == 0 and ts.minute != previous_minute and len(inverter_data) > 0:
+        t = Thread(target=publish_pv_output, args=(inverter_data, ts,))
+        t.start()
+        inverter_data = []
+        previous_minute = ts.minute
+      if (len(inverter)) > 1:
+        inverter_data.append(inverter)
+
+    client.close()
   except Exception as err:
     print ("[ERROR] %s" % err)
-    client.close()
-    client.connect()
+
   time.sleep(config.scan_interval)
